@@ -29,13 +29,21 @@
 package com.hbm.devices.scan;
 
 import java.io.IOException;
-import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.MulticastSocket;
 import java.net.NetworkInterface;
+import java.net.SocketAddress;
+import java.net.StandardProtocolFamily;
+import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
+import java.nio.channels.MembershipKey;
+import java.nio.channels.MulticastChannel;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Collection;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -65,7 +73,8 @@ public class MulticastMessageReceiver extends AbstractMessageReceiver {
     private final int port;
     private final Predicate<NetworkInterface> ifacePredicate;
     private boolean shallRun = true;
-    private final MulticastSocket socket;
+    private final DatagramChannel channel;
+    private final List<MembershipKey> membershipKeys;
     private static final Logger LOGGER = Logger.getLogger(ScanConstants.LOGGER_NAME);
     private static final int MAX_UDP_SIZE = 65507;
 
@@ -125,7 +134,9 @@ public class MulticastMessageReceiver extends AbstractMessageReceiver {
         this.multicastIP = multicastIP;
         this.port = port;
         this.ifacePredicate = ifacePredicate;
-        this.socket = setupMulticastSocket();
+
+        this.membershipKeys = new LinkedList<>();
+        this.channel = setupMulticastChannel();
     }
 
     /**
@@ -136,13 +147,15 @@ public class MulticastMessageReceiver extends AbstractMessageReceiver {
      */
     @Override
     public void run() {
+        final Charset charset = StandardCharsets.UTF_8;
         final byte[] buffer = new byte[MAX_UDP_SIZE];
-        final Charset charset = Charset.forName("UTF-8");
-        final DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+        final ByteBuffer byteBuffer = ByteBuffer.wrap(buffer);
+
         while (shallRun) {
             try {
-                socket.receive(packet);
-                final String message = new String(buffer, 0, packet.getLength(), charset);
+                byteBuffer.clear();
+                SocketAddress a = channel.receive(byteBuffer);
+                String message = new String(buffer, 0, byteBuffer.position(), charset);
                 setChanged();
                 notifyObservers(message);
             } catch (IOException e) {
@@ -168,8 +181,8 @@ public class MulticastMessageReceiver extends AbstractMessageReceiver {
     public void close() {
         shallRun = false;
         try {
-            leaveOnAllInterfaces(socket);
-            socket.close();
+            leaveOnAllInterfaces(channel);
+            channel.close();
         } catch (IOException e) {
             /*
              * No error handling by intention. Stopping to receive datagrams is best effort.
@@ -178,27 +191,30 @@ public class MulticastMessageReceiver extends AbstractMessageReceiver {
         }
     }
 
-    private MulticastSocket setupMulticastSocket() throws IOException {
-        final MulticastSocket sock = new MulticastSocket(port);
-        sock.setReuseAddress(true);
-
-        joinOnAllInterfaces(sock);
-        return sock;
+    private DatagramChannel setupMulticastChannel() throws IOException {
+        final DatagramChannel datagramChannel = DatagramChannel.open(StandardProtocolFamily.INET);
+        datagramChannel.configureBlocking(true);
+        datagramChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+        datagramChannel.bind(new InetSocketAddress(port));
+        joinAllInterfaces(datagramChannel);
+        return datagramChannel;
     }
 
-    private void joinOnAllInterfaces(MulticastSocket socket) throws IOException {
-        final InetSocketAddress socketAddress = new InetSocketAddress(multicastIP, port);
+    private void joinAllInterfaces(MulticastChannel multicastChannel) throws IOException {
         final Collection<NetworkInterface> interfaces = new ScanInterfaces(ifacePredicate).getInterfaces();
         for (final NetworkInterface ni : interfaces) {
-            socket.joinGroup(socketAddress, ni);
+            MembershipKey key = multicastChannel.join(multicastIP, ni);
+            if (!key.isValid()) {
+                throw  new IOException("Membership key invalid!");
+            }
+
+            membershipKeys.add(key);
         }
     }
 
-    private void leaveOnAllInterfaces(MulticastSocket socket) throws IOException {
-        final Collection<NetworkInterface> interfaces = new ScanInterfaces(ifacePredicate).getInterfaces();
-        final InetSocketAddress socketAddress = new InetSocketAddress(multicastIP, port);
-        for (final NetworkInterface ni : interfaces) {
-            socket.leaveGroup(socketAddress, ni);
+    private void leaveOnAllInterfaces(MulticastChannel multicastChannel) throws IOException {
+        for (MembershipKey key: membershipKeys) {
+            key.drop();
         }
     }
 }
